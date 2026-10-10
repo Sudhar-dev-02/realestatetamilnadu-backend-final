@@ -205,10 +205,31 @@ const getAssignedSellersProperties = async (req, res, next) => {
       .limit(limit)
       .lean();
 
+    const PromotionSetting = require('../models/PromotionSetting');
+    const promoSettings = await PromotionSetting.findOne() || {};
+    const freeValidityDays = promoSettings.sellerListingSettings?.freeListingValidityDays ?? 30;
+    const expiryThreshold = new Date();
+    expiryThreshold.setDate(expiryThreshold.getDate() - freeValidityDays);
+
+    const propertiesWithExpiry = properties.map((p) => {
+      const isPaid = p.listingPayment?.isPaid === true;
+      const isExpired = !isPaid && p.createdAt < expiryThreshold;
+      
+      let daysLeft = null;
+      if (!isPaid) {
+        const expiryDate = new Date(p.createdAt);
+        expiryDate.setDate(expiryDate.getDate() + freeValidityDays);
+        const diffTime = expiryDate - new Date();
+        daysLeft = Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
+      }
+
+      return { ...p, isExpired, daysLeft };
+    });
+
     return sendPaginated(
       res,
       'Properties of assigned sellers retrieved',
-      properties,
+      propertiesWithExpiry,
       total,
       page,
       limit

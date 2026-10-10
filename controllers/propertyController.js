@@ -6,6 +6,7 @@ const SubscriptionTransaction = require('../models/SubscriptionTransaction');
 const { User, ROLES } = require('../models/User');
 const authService = require('../services/authService');
 const { sendSuccess, sendError, sendPaginated } = require('../utils/apiResponse');
+const { cashfreeApiRequest, CASHFREE_ENV } = require('./paymentController');
 
 const escapeRegex = (string) => {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -24,6 +25,29 @@ const getPublicProperties = async (req, res, next) => {
 
     const query = { status: 'available' };
 
+    const andConditions = [];
+
+    // Exclude properties belonging to unverified mediators (either as mediator or as seller)
+    const unverifiedMediators = await User.find({ role: 'MEDIATOR', isVerified: false }).select('_id').lean();
+    if (unverifiedMediators && unverifiedMediators.length > 0) {
+      const unverifiedIds = unverifiedMediators.map((u) => u._id);
+      andConditions.push({ mediator: { $nin: unverifiedIds } });
+      andConditions.push({ seller: { $nin: unverifiedIds } });
+    }
+
+    // Exclude free properties that have expired
+    const promoSettings = await PromotionSetting.findOne() || {};
+    const freeValidityDays = promoSettings.sellerListingSettings?.freeListingValidityDays ?? 30;
+    const expiryDate = new Date();
+    expiryDate.setDate(expiryDate.getDate() - freeValidityDays);
+    
+    andConditions.push({
+      $or: [
+        { 'listingPayment.isPaid': true },
+        { createdAt: { $gte: expiryDate } }
+      ]
+    });
+
     // Filter by purpose ('forSale' | 'forRent')
     if (req.query.purpose && req.query.purpose !== 'all') {
       query.purpose = req.query.purpose;
@@ -33,8 +57,6 @@ const getPublicProperties = async (req, res, next) => {
     if (req.query.propertyType && req.query.propertyType !== 'All Types') {
       query.propertyType = req.query.propertyType;
     }
-
-    const andConditions = [];
 
     // Filter by location / city / address / state / district
     if (req.query.location && String(req.query.location).trim()) {
@@ -173,6 +195,22 @@ const getPublicPropertyById = async (req, res, next) => {
 
     if (!property) {
       return sendError(res, 'Property listing not found', 404);
+    }
+
+    // If property belongs to an unverified mediator, hide it
+    if (property.mediator && property.mediator.isVerified === false) {
+      return sendError(res, 'This property listing is currently unavailable (Mediator Verification Pending)', 403);
+    }
+
+    // Check if free property has expired
+    const promoSettings = await PromotionSetting.findOne() || {};
+    const freeValidityDays = promoSettings.sellerListingSettings?.freeListingValidityDays ?? 30;
+    const expiryDate = new Date();
+    expiryDate.setDate(expiryDate.getDate() - freeValidityDays);
+    
+    const isPaid = property.listingPayment?.isPaid === true;
+    if (!isPaid && property.createdAt < expiryDate) {
+      return sendError(res, 'This property listing has expired. The seller needs to renew it to make it public.', 403);
     }
 
     // Fetch Super Admin details for fallback display
@@ -480,15 +518,50 @@ const submitPublicProperty = async (req, res, next) => {
           sellerUser = existingUser;
           authToken = existingUser.getSignedJwtToken();
         } else {
-          // Register new Seller via Google
-          const registered = await authService.googleRegister({
-            name: googleUserData.name || propertyData.ownerName || 'Property Seller',
-            email: cleanEmail,
-            role: 'SELLER',
-            phone: propertyData.contactPhone || googleUserData.phone || '',
-            avatar: googleUserData.avatar || '/images/avatar/default-user.jpg',
-            googleId: googleUserData.googleId || '',
-          });
+          // Register brand new Unassigned Seller (role: 'SELLER', referredBy: null)
+          let registered = null;
+          try {
+            if (googleUserData.accessToken || googleUserData.token || googleUserData.googleAuthToken) {
+              registered = await authService.googleRegister({
+                name: googleUserData.name || propertyData.ownerName || 'Property Seller',
+                email: cleanEmail,
+                role: 'SELLER',
+                phone: propertyData.contactPhone || googleUserData.phone || '',
+                avatar: googleUserData.avatar || '/images/avatar/default-user.jpg',
+                googleId: googleUserData.googleId || '',
+                accessToken: googleUserData.accessToken,
+                token: googleUserData.token,
+                googleAuthToken: googleUserData.googleAuthToken,
+              });
+            }
+          } catch (regErr) {
+            console.warn('[submitPublicProperty] authService.googleRegister notice:', regErr.message);
+          }
+
+          if (!registered || !registered.user) {
+            const crypto = require('crypto');
+            const randomPassword = crypto.randomBytes(16).toString('hex') + 'A1!';
+            const newSeller = await User.create({
+              name: (googleUserData.name || propertyData.ownerName || 'Property Seller').trim(),
+              email: cleanEmail,
+              password: randomPassword,
+              role: 'SELLER',
+              phone: (propertyData.contactPhone || googleUserData.phone || '').trim(),
+              referralCode: null,
+              referredBy: null, // UNASSIGNED SELLER (no mediator assigned, directly managed by Super Admin)
+              profile: {
+                avatar: googleUserData.avatar || '/images/avatar/default-user.jpg',
+                city: propertyData.district || 'Tamil Nadu',
+                state: 'Tamil Nadu',
+              },
+              isActive: true,
+            });
+            registered = {
+              user: newSeller,
+              token: newSeller.getSignedJwtToken(),
+            };
+          }
+
           sellerUser = registered.user;
           authToken = registered.token;
         }
@@ -566,26 +639,100 @@ const submitPublicProperty = async (req, res, next) => {
           !paymentDetails.paymentId &&
           !paymentDetails.isFreeOverride)
       ) {
+        // Generate Cashfree Order for ₹paidFee listing charge
+        const orderId = `lst_${sellerUser._id.toString().slice(-6)}_${Date.now()}`;
+        let rawPhone = sellerUser.phone ? String(sellerUser.phone).replace(/\D/g, '') : '';
+        if (rawPhone.length < 10) rawPhone = '9999999999';
+        else if (rawPhone.length > 10) rawPhone = rawPhone.slice(-10);
+
+        let clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+        let returnUrl = `${clientUrl}/#/submit-property?order_id={order_id}`;
+
+        let cashfreeOrder = null;
+        try {
+          const cfResponse = await cashfreeApiRequest('/pg/orders', 'POST', {
+            order_id: orderId,
+            order_amount: Number(paidFee) || 99,
+            order_currency: 'INR',
+            customer_details: {
+              customer_id: sellerUser._id.toString(),
+              customer_name: sellerUser.name || 'Property Seller',
+              customer_email: sellerUser.email || 'seller@realestatetamilnadu.com',
+              customer_phone: rawPhone,
+            },
+            order_meta: {
+              return_url: returnUrl,
+            },
+          });
+
+          cashfreeOrder = {
+            orderId: cfResponse.order_id,
+            paymentSessionId: cfResponse.payment_session_id,
+            orderAmount: cfResponse.order_amount,
+            orderCurrency: cfResponse.order_currency,
+            environment: CASHFREE_ENV,
+          };
+        } catch (cfErr) {
+          console.error('[submitPublicProperty] Cashfree Order creation notice:', cfErr.message);
+          return sendError(res, `Failed to initialize Cashfree payment: ${cfErr.message}`, 500);
+        }
+
         return res.status(402).json({
           success: false,
           paymentRequired: true,
-          message: `You have reached your free listing quota (${freeLimit} property). Please pay ₹${paidFee} to list this property.`,
+          message: `Please complete the ₹${paidFee} listing payment via Cashfree to publish your property.`,
+          cashfreeOrder,
+          token: authToken,
+          user: {
+            _id: sellerUser._id,
+            name: sellerUser.name,
+            email: sellerUser.email,
+            phone: sellerUser.phone,
+            role: sellerUser.role || 'SELLER',
+          },
           data: {
             currentCount: existingCount,
             freeLimit,
             paidFee,
-            qrCodeImage: settings.qrCodeImage || '',
+            cashfreeOrder,
           },
         });
       }
 
       // Valid payment provided
       txId =
-        paymentDetails.transactionId ||
         paymentDetails.orderId ||
+        paymentDetails.transactionId ||
         paymentDetails.paymentId ||
         `TXN-LST-${Date.now()}`;
       amountPaid = Number(paymentDetails.amountPaid) || paidFee;
+
+      // Verify status directly with Cashfree if orderId is provided
+      if (paymentDetails.orderId && !paymentDetails.isFreeOverride) {
+        const orderId = String(paymentDetails.orderId).trim();
+        try {
+          const orderDetails = await cashfreeApiRequest(`/pg/orders/${orderId}`, 'GET');
+          if (orderDetails.order_status !== 'PAID' && orderDetails.order_status !== 'SUCCESS') {
+            return sendError(res, `Payment is not completed. Cashfree status: ${orderDetails.order_status}`, 400);
+          }
+          txId = orderId;
+          amountPaid = Number(orderDetails.order_amount) || paidFee;
+          try {
+            const paymentsList = await cashfreeApiRequest(`/pg/orders/${orderId}/payments`, 'GET');
+            if (Array.isArray(paymentsList) && paymentsList.length > 0) {
+              const successPayment = paymentsList.find((p) => p.payment_status === 'SUCCESS') || paymentsList[0];
+              if (successPayment && (successPayment.cf_payment_id || successPayment.payment_id)) {
+                txId = String(successPayment.cf_payment_id || successPayment.payment_id);
+              }
+            }
+          } catch (err) {
+            console.warn('[submitPublicProperty] Could not fetch Cashfree payment ID, using orderId:', err.message);
+          }
+        } catch (vErr) {
+          console.error('[submitPublicProperty] Cashfree verification failed:', vErr.message);
+          return sendError(res, `Payment gateway verification failed: ${vErr.message}`, 400);
+        }
+      }
 
       listingPaymentData = {
         isPaid: true,
@@ -595,283 +742,343 @@ const submitPublicProperty = async (req, res, next) => {
       };
     }
 
-      // Validate and build property fields
-      const title = propertyData.title || propertyData.plotName || 'Plot / Property Listing';
-      const price = Number(propertyData.price);
-      if (isNaN(price) || price < 0) {
-        return sendError(res, 'Please provide a valid property price.', 400);
+    // Validate and build property fields
+    const title = propertyData.title || propertyData.plotName || 'Plot / Property Listing';
+    const price = Number(propertyData.price);
+    if (isNaN(price) || price < 0) {
+      return sendError(res, 'Please provide a valid property price.', 400);
+    }
+
+    let images = [];
+    if (Array.isArray(propertyData.images) && propertyData.images.length > 0) {
+      images = propertyData.images.filter((img) => img && typeof img === 'string' && img.trim() !== '');
+    } else if (propertyData.imageUrl) {
+      images = [propertyData.imageUrl];
+    }
+
+    if (images.length === 0) {
+      return sendError(res, 'Please upload at least one property photo.', 400);
+    }
+
+    const city = propertyData.city || propertyData.district || 'Tamil Nadu';
+    const address = propertyData.address || propertyData.locality || propertyData.location || city;
+    const propertyType = propertyData.propertyType || 'Plot';
+    const sqft = Number(propertyData.sqft) || Number(propertyData.landArea) || Number(propertyData.size) || 0;
+
+    let cleanPurpose = propertyData.purpose || 'forSale';
+    if (cleanPurpose === 'For Sale' || cleanPurpose === 'forSale') cleanPurpose = 'forSale';
+    else if (cleanPurpose === 'For Rent' || cleanPurpose === 'forRent') cleanPurpose = 'forRent';
+    else if (cleanPurpose === 'Lease' || cleanPurpose === 'lease') cleanPurpose = 'forSale';
+
+    let cleanLandUnit = propertyData.landUnit || 'sqft';
+    const lu = String(cleanLandUnit).toLowerCase().replace(/[^a-z]/g, '');
+    if (lu.includes('sq') || lu.includes('ft')) cleanLandUnit = 'sqft';
+    else if (lu.includes('cent')) cleanLandUnit = 'cent';
+    else if (lu.includes('acre')) cleanLandUnit = 'acre';
+    else if (lu.includes('ground')) cleanLandUnit = 'ground';
+
+    const newProperty = await Property.create({
+      ...propertyData,
+      title: title.trim(),
+      propertyType,
+      purpose: cleanPurpose,
+      price,
+      priceFormatted: `₹ ${price.toLocaleString('en-IN')}`,
+      address: address.trim(),
+      city: city.trim(),
+      state: 'Tamil Nadu',
+      pincode: propertyData.pincode || '',
+      sqft,
+      landArea: sqft,
+      landUnit: cleanLandUnit,
+      images,
+      ownerName: (propertyData.ownerName || sellerUser.name || '').trim(),
+      contactPhone: (propertyData.contactPhone || sellerUser.phone || '').trim(),
+      district: (propertyData.district || city || '').trim(),
+      locality: (propertyData.locality || address || '').trim(),
+      roadWidth: propertyData.roadWidth || '',
+      facingDirection: propertyData.facingDirection || '',
+      approvalStatus: propertyData.approvalStatus || '',
+      priceNegotiable: propertyData.priceNegotiable || 'Yes',
+      documents: Array.isArray(propertyData.documents) ? propertyData.documents : [],
+      cornerPlot: Boolean(propertyData.cornerPlot),
+      gatedCommunity: Boolean(propertyData.gatedCommunity),
+      waterAvailable: Boolean(propertyData.waterAvailable),
+      electricityAvailable: Boolean(propertyData.electricityAvailable),
+      seller: sellerUser._id,
+      mediator: sellerUser.referredBy || null,
+      status: 'available',
+      listingPayment: listingPaymentData,
+    });
+
+    if (isPaymentRequired && txId) {
+      try {
+        await SubscriptionTransaction.create({
+          user: sellerUser._id,
+          userName: sellerUser.name || 'Property Seller',
+          userRole: 'SELLER',
+          userEmail: sellerUser.email || '',
+          planName: `Pay-Per-Listing Fee (₹${paidFee})`,
+          billingCycle: 'pay_per_listing',
+          amountPaid,
+          currency: 'INR',
+          transactionStatus: 'success',
+          paymentMethod: paymentDetails.paymentMethod || 'Cashfree PG',
+          transactionId: txId,
+          property: newProperty._id,
+          propertyTitle: newProperty.title,
+          propertyCity: newProperty.city || newProperty.district,
+          propertyType: newProperty.propertyType,
+          purchaseDate: new Date(),
+        });
+      } catch (txErr) {
+        console.warn('Listing transaction logging notice:', txErr.message);
       }
+    }
 
-      let images = [];
-      if (Array.isArray(propertyData.images) && propertyData.images.length > 0) {
-        images = propertyData.images.filter((img) => img && typeof img === 'string' && img.trim() !== '');
-      } else if (propertyData.imageUrl) {
-        images = [propertyData.imageUrl];
-      }
+    const isAssigned = !!sellerUser.referredBy;
+    const adminContactInfo = {
+      name: 'Platform Super Admin',
+      phone: '+91 98765 43210',
+      email: 'admin@realestatetn.com',
+    };
 
-      if (images.length === 0) {
-        return sendError(res, 'Please upload at least one property photo.', 400);
-      }
-
-      const city = propertyData.city || propertyData.district || 'Tamil Nadu';
-      const address = propertyData.address || propertyData.location || city;
-      const propertyType = propertyData.propertyType || 'Plot';
-      const sqft = Number(propertyData.sqft) || Number(propertyData.size) || 0;
-
-      const newProperty = await Property.create({
-        title: title.trim(),
-        propertyType,
-        purpose: propertyData.purpose || 'forSale',
-        price,
-        priceFormatted: `₹ ${price.toLocaleString('en-IN')}`,
-        address: address.trim(),
-        city: city.trim(),
-        state: 'Tamil Nadu',
-        pincode: propertyData.pincode || '',
-        sqft,
-        landArea: sqft,
-        ...propertyData,
-        seller: sellerUser._id,
-        mediator: sellerUser.referredBy || null,
-        status: 'available',
-        listingPayment: listingPaymentData,
-      });
-
-      if (isPaymentRequired && txId) {
-        try {
-          await SubscriptionTransaction.create({
-            user: sellerUser._id,
-            userName: sellerUser.name || 'Property Seller',
-            userRole: 'SELLER',
-            userEmail: sellerUser.email || '',
-            planName: `Pay-Per-Listing Fee (₹${paidFee})`,
-            billingCycle: 'pay_per_listing',
-            amountPaid,
-            currency: 'INR',
-            transactionStatus: 'success',
-            paymentMethod: paymentDetails.paymentMethod || 'UPI / Online',
-            transactionId: txId,
-            property: newProperty._id,
-            propertyTitle: newProperty.title,
-            propertyCity: newProperty.city || newProperty.district,
-            propertyType: newProperty.propertyType,
-            purchaseDate: new Date(),
-          });
-        } catch (txErr) {
-          console.warn('Listing transaction logging notice:', txErr.message);
-        }
-      }
-
-      const isAssigned = !!sellerUser.referredBy;
-      const adminContactInfo = {
-        name: 'Platform Super Admin',
-        phone: '+91 98765 43210',
-        email: 'admin@realestatetn.com',
-      };
-
-      return sendSuccess(
-        res,
-        'Property submitted successfully!',
-        {
-          property: newProperty,
-          seller: {
-            _id: sellerUser._id,
-            name: sellerUser.name,
-            email: sellerUser.email,
-            phone: sellerUser.phone,
-            role: sellerUser.role,
-            sellerPlan: 'free',
-            isAssignedToMediator: isAssigned,
-          },
-          listingQuota: {
-            totalListed: existingCount + 1,
-            freeLimit,
-            isPaidListing: isPaymentRequired,
-          },
-          token: authToken,
-          routingInfo: isAssigned
-            ? 'Your listing has been assigned to your registered mediator for buyer enquiry management.'
-            : 'Your listing is directly managed by Real Estate Tamil Nadu Super Admin.',
-          adminContact: adminContactInfo,
+    return sendSuccess(
+      res,
+      'Property submitted successfully!',
+      {
+        property: newProperty,
+        user: {
+          _id: sellerUser._id,
+          name: sellerUser.name,
+          email: sellerUser.email,
+          phone: sellerUser.phone,
+          role: sellerUser.role || 'SELLER',
         },
-        201
-      );
-    } catch (error) {
-      next(error);
-    }
-  };
-
-  /**
-   * @desc    Get Seller Listing Quota (Current property count vs Admin free listing limit)
-   * @route   GET /api/properties/seller-listing-quota
-   * @access  Public / Optional Auth
-   */
-  const getSellerListingQuota = async (req, res, next) => {
-    try {
-      let settings = await PromotionSetting.findOne();
-      if (!settings) {
-        settings = await PromotionSetting.create({});
-      }
-
-      const freeLimit =
-        settings.sellerListingSettings?.freeListingLimit !== undefined
-          ? settings.sellerListingSettings.freeListingLimit
-          : 1;
-      const paidFee =
-        settings.sellerListingSettings?.paidListingFee !== undefined
-          ? settings.sellerListingSettings.paidListingFee
-          : 99;
-
-      let sellerUser = req.user;
-      let authToken = req.headers.authorization?.startsWith('Bearer ')
-        ? req.headers.authorization.split(' ')[1]
-        : null;
-
-      if (!sellerUser && authToken) {
-        if (process.env.JWT_SECRET) {
-          const decoded = jwt.verify(authToken, process.env.JWT_SECRET);
-          sellerUser = await User.findById(decoded.id);
-        }
-      }
-
-      if (!sellerUser && req.query.email) {
-        sellerUser = await User.findOne({ email: req.query.email.trim().toLowerCase() });
-      } else if (!sellerUser && req.query.phone) {
-        sellerUser = await User.findOne({ phone: req.query.phone.trim() });
-      }
-
-      let currentCount = 0;
-      if (sellerUser) {
-        currentCount = await Property.countDocuments({ seller: sellerUser._id });
-      }
-
-      const isPaymentRequired = currentCount >= freeLimit;
-      const remainingFree = Math.max(0, freeLimit - currentCount);
-
-      return sendSuccess(res, 'Seller listing quota retrieved', {
-        currentCount,
-        freeLimit,
-        remainingFree,
-        paidFee,
-        isPaymentRequired,
-        qrCodeImage: settings.qrCodeImage || '',
-      });
-    } catch (error) {
-      next(error);
-    }
-  };
-
-  /**
-   * @desc    Get Public Mediator Profile & Listings by Mediator ID
-   * @route   GET /api/properties/mediator-public/:id
-   * @access  Public
-   */
-  const getPublicMediatorProfile = async (req, res, next) => {
-    try {
-      const mediatorId = req.params.id;
-      const mediator = await User.findOne({ _id: mediatorId, role: 'MEDIATOR' }).select(
-        '_id name email phone profile referralCode isVerified role createdAt'
-      );
-
-      if (!mediator) {
-        return sendError(res, 'Mediator profile not found', 404);
-      }
-
-      const properties = await Property.find({
-        mediator: mediatorId,
-        status: 'available',
-      })
-        .populate('seller', 'name email phone')
-        .sort({ createdAt: -1 })
-        .limit(30);
-
-      const sellersCount = await User.countDocuments({
-        role: 'SELLER',
-        referredBy: mediatorId,
-      });
-
-      const enquiriesCount = await PropertyEnquiry.countDocuments({
-        mediator: mediatorId,
-      });
-
-      return sendSuccess(res, 'Public mediator profile retrieved successfully', {
-        mediator,
-        properties,
-        stats: {
-          activeProperties: properties.length || 0,
-          registeredSellers: sellersCount || 0,
-          buyerEnquiries: enquiriesCount || 0,
+        seller: {
+          _id: sellerUser._id,
+          name: sellerUser.name,
+          email: sellerUser.email,
+          phone: sellerUser.phone,
+          role: sellerUser.role || 'SELLER',
+          sellerPlan: 'free',
+          isAssignedToMediator: isAssigned,
         },
-      });
-    } catch (error) {
-      next(error);
-    }
-  };
+        listingQuota: {
+          totalListed: existingCount + 1,
+          freeLimit,
+          isPaidListing: isPaymentRequired,
+        },
+        token: authToken,
+        routingInfo: isAssigned
+          ? 'Your listing has been assigned to your registered mediator for buyer enquiry management.'
+          : 'Your listing is directly managed by Real Estate Tamil Nadu Super Admin.',
+        adminContact: adminContactInfo,
+      },
+      201
+    );
+  } catch (error) {
+    next(error);
+  }
+};
 
-  /**
-   * @desc    Get Public Seller Profile & Listings by Seller ID
-   * @route   GET /api/properties/seller-public/:id
-   * @access  Public
-   */
-  const getPublicSellerProfile = async (req, res, next) => {
-    try {
-      const sellerId = req.params.id;
-      const seller = await User.findOne({ _id: sellerId }).select(
+/**
+ * @desc    Get Seller Listing Quota (Current property count vs Admin free listing limit)
+ * @route   GET /api/properties/seller-listing-quota
+ * @access  Public / Optional Auth
+ */
+const getSellerListingQuota = async (req, res, next) => {
+  try {
+    let settings = await PromotionSetting.findOne();
+    if (!settings) {
+      settings = await PromotionSetting.create({});
+    }
+
+    const freeLimit =
+      settings.sellerListingSettings?.freeListingLimit !== undefined
+        ? settings.sellerListingSettings.freeListingLimit
+        : 1;
+    const paidFee =
+      settings.sellerListingSettings?.paidListingFee !== undefined
+        ? settings.sellerListingSettings.paidListingFee
+        : 99;
+
+    let sellerUser = req.user;
+    let authToken = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.split(' ')[1]
+      : null;
+
+    if (!sellerUser && authToken) {
+      if (process.env.JWT_SECRET) {
+        const decoded = jwt.verify(authToken, process.env.JWT_SECRET);
+        sellerUser = await User.findById(decoded.id);
+      }
+    }
+
+    if (!sellerUser && req.query.email) {
+      sellerUser = await User.findOne({ email: req.query.email.trim().toLowerCase() });
+    } else if (!sellerUser && req.query.phone) {
+      sellerUser = await User.findOne({ phone: req.query.phone.trim() });
+    }
+
+    let currentCount = 0;
+    if (sellerUser) {
+      currentCount = await Property.countDocuments({ seller: sellerUser._id });
+    }
+
+    const isPaymentRequired = currentCount >= freeLimit;
+    const remainingFree = Math.max(0, freeLimit - currentCount);
+
+    return sendSuccess(res, 'Seller listing quota retrieved', {
+      currentCount,
+      freeLimit,
+      remainingFree,
+      paidFee,
+      isPaymentRequired,
+      qrCodeImage: settings.qrCodeImage || '',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get Public Mediator Profile & Listings by Mediator ID
+ * @route   GET /api/properties/mediator-public/:id
+ * @access  Public
+ */
+const getPublicMediatorProfile = async (req, res, next) => {
+  try {
+    const mediatorId = req.params.id;
+    const mediator = await User.findOne({ _id: mediatorId, role: 'MEDIATOR' }).select(
+      '_id name email phone profile referralCode isVerified role createdAt'
+    );
+
+    if (!mediator) {
+      return sendError(res, 'Mediator profile not found', 404);
+    }
+
+    if (mediator.isVerified === false) {
+      return sendError(res, 'This mediator is currently pending verification and their profile is not public.', 403);
+    }
+
+    const properties = await Property.find({
+      mediator: mediatorId,
+      status: 'available',
+    })
+      .populate('seller', 'name email phone')
+      .sort({ createdAt: -1 })
+      .limit(30);
+
+    const sellersCount = await User.countDocuments({
+      role: 'SELLER',
+      referredBy: mediatorId,
+    });
+
+    const enquiriesCount = await PropertyEnquiry.countDocuments({
+      mediator: mediatorId,
+    });
+
+    return sendSuccess(res, 'Public mediator profile retrieved successfully', {
+      mediator,
+      properties,
+      stats: {
+        activeProperties: properties.length || 0,
+        registeredSellers: sellersCount || 0,
+        buyerEnquiries: enquiriesCount || 0,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get Public Seller Profile & Listings by Seller ID
+ * @route   GET /api/properties/seller-public/:id
+ * @access  Public
+ */
+const getPublicSellerProfile = async (req, res, next) => {
+  try {
+    const sellerId = req.params.id;
+    let seller = null;
+
+    if (mongoose.Types.ObjectId.isValid(sellerId)) {
+      seller = await User.findOne({ _id: sellerId }).select(
         '_id name email phone profile referralCode isVerified role createdAt sellerPlan subscription'
       );
-
-      if (!seller) {
-        return sendError(res, 'Seller profile not found', 404);
-      }
-
-      const properties = await Property.find({
-        seller: sellerId,
-        status: 'available',
-      })
-        .sort({ createdAt: -1 })
-        .limit(30);
-
-      const enquiriesCount = await PropertyEnquiry.countDocuments({
-        seller: sellerId,
-      });
-
-      const sellerCode = seller.referralCode || `RTN-SEL-${seller._id.toString().slice(-5).toUpperCase()}`;
-
-      const sellerObj = seller.toObject();
-      // All Sellers have their direct contacts & social links UNLOCKED
-      sellerObj.isSocialLocked = false;
-      sellerObj.isContactLocked = false;
-      sellerObj.isPremium = true;
-      sellerObj.sellerPlan = 'free';
-
-      return sendSuccess(res, 'Public seller profile retrieved successfully', {
-        seller: sellerObj,
-        sellerCode,
-        isPremium: true,
-        sellerPlan: 'free',
-        properties,
-        stats: {
-          activeProperties: properties.length || 0,
-          buyerEnquiries: enquiriesCount > 0 ? enquiriesCount : 14,
-          siteVisits: enquiriesCount > 0 ? Math.max(1, Math.round(enquiriesCount * 0.3)) : 4,
-          inNegotiation: properties.length > 0 ? 1 : 0,
-        },
-      });
-    } catch (error) {
-      next(error);
     }
-  };
 
-  module.exports = {
-    getPublicProperties,
-    getPublicPropertyById,
-    addPropertyReview,
-    markPropertyInterested,
-    unmarkPropertyInterested,
-    submitPropertyEnquiry,
-    submitPublicProperty,
-    getSellerListingQuota,
-    getPublicMediatorProfile,
-    getPublicSellerProfile,
-  };
+    if (!seller) {
+      seller = await User.findOne({
+        $or: [
+          { referralCode: sellerId },
+          { 'profile.referralCode': sellerId },
+        ],
+      }).select(
+        '_id name email phone profile referralCode isVerified role createdAt sellerPlan subscription'
+      );
+    }
+
+    if (!seller) {
+      return sendError(res, 'Seller profile not found', 404);
+    }
+
+    if (seller.referredBy) {
+      const mediator = await User.findById(seller.referredBy).select('isVerified');
+      if (mediator && mediator.isVerified === false) {
+        return sendError(res, 'This seller is associated with a mediator whose verification is pending.', 403);
+      }
+    }
+
+    const properties = await Property.find({
+      $or: [{ seller: seller._id }, { createdBy: seller._id }],
+      status: { $ne: 'inactive' },
+    })
+      .sort({ createdAt: -1 })
+      .limit(30);
+
+    const enquiriesCount = await PropertyEnquiry.countDocuments({
+      seller: seller._id,
+    });
+
+    const sellerCode = seller.referralCode || `RTN-SEL-${seller._id.toString().slice(-5).toUpperCase()}`;
+
+    const sellerObj = seller.toObject();
+    // All Sellers have their direct contacts & social links UNLOCKED
+    sellerObj.isSocialLocked = false;
+    sellerObj.isContactLocked = false;
+    sellerObj.isPremium = true;
+    sellerObj.sellerPlan = 'free';
+
+    return sendSuccess(res, 'Public seller profile retrieved successfully', {
+      seller: sellerObj,
+      sellerCode,
+      isPremium: true,
+      sellerPlan: 'free',
+      properties,
+      stats: {
+        activeProperties: properties.length || 0,
+        buyerEnquiries: enquiriesCount > 0 ? enquiriesCount : 14,
+        siteVisits: enquiriesCount > 0 ? Math.max(1, Math.round(enquiriesCount * 0.3)) : 4,
+        inNegotiation: properties.length > 0 ? 1 : 0,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  getPublicProperties,
+  getPublicPropertyById,
+  addPropertyReview,
+  markPropertyInterested,
+  unmarkPropertyInterested,
+  submitPropertyEnquiry,
+  submitPublicProperty,
+  getSellerListingQuota,
+  getPublicMediatorProfile,
+  getPublicSellerProfile,
+};
 

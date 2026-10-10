@@ -30,6 +30,7 @@ const PromotionSettingSchema = new mongoose.Schema(
     // Seller Property Listing Quota & Pricing Settings (Pay-Per-Listing Model)
     sellerListingSettings: {
       freeListingLimit: { type: Number, default: 1 }, // Number of properties a seller can list for FREE
+      freeListingValidityDays: { type: Number, default: 30 }, // Validity of free properties in days before they expire
       paidListingFee: { type: Number, default: 99 },   // Price in INR charged for each additional property listing
     },
     // Seller Premium Plan Pricing (Legacy)

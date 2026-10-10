@@ -5,6 +5,7 @@ const {
   upgradeSellerPlan,
   getMyProperties,
   createProperty,
+  renewProperty,
   updateMyProperty,
   deleteMyProperty,
   createPromotionRequest,
@@ -30,6 +31,7 @@ router.post('/upgrade-plan', upgradeSellerPlan);
 // Seller's Own Properties
 router.get('/properties', getMyProperties);
 router.post('/properties', createProperty);
+router.post('/properties/:id/renew', renewProperty);
 router.put('/properties/:id', updateMyProperty);
 router.delete('/properties/:id', deleteMyProperty);
 

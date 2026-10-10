@@ -124,6 +124,35 @@ const loginUser = async (identifier, password) => {
   const cleanIdentifier = identifier.trim().toLowerCase();
   const escapedIdentifier = cleanIdentifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+  const envAdminEmail = process.env.ADMIN_EMAIL || 'admin@realestatetamilnadu.com';
+  const envAdminPassword = process.env.ADMIN_PASSWORD || 'Admin@123456';
+
+  // Check if logging in as Admin via .env credentials
+  if (cleanIdentifier === envAdminEmail.toLowerCase() && password === envAdminPassword) {
+    let adminUser = await User.findOne({ email: cleanIdentifier }).populate('referredBy', 'name email phone referralCode');
+    if (!adminUser) {
+      adminUser = await User.create({
+        name: 'Root Super Admin',
+        email: envAdminEmail,
+        password: envAdminPassword,
+        role: ROLES.SUPER_ADMIN,
+        phone: '+91 98765 43210',
+        isActive: true,
+        profile: {
+          agencyName: 'Real Estate Tamil Nadu HQ',
+          city: 'Chennai',
+          state: 'Tamil Nadu',
+        },
+      });
+    } else {
+      // Optionally update password if .env changed
+      adminUser.password = envAdminPassword;
+      await adminUser.save();
+    }
+    const token = adminUser.getSignedJwtToken();
+    return { user: adminUser, token };
+  }
+
   // Find user by email or name with password field included
   const user = await User.findOne({
     $or: [{ email: cleanIdentifier }, { name: { $regex: new RegExp(`^${escapedIdentifier}$`, 'i') } }],

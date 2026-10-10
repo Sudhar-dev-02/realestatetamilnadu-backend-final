@@ -10,12 +10,17 @@ const PROPERTY_TYPES = [
   'Commercial',
   'Office',
   'Studio',
+  'Residential Plot',
+  'House / Villa',
+  'Apartment / Flat',
+  'Agricultural Land',
+  'Office Space',
   'Other',
 ];
 
 const PROPERTY_STATUS = ['available', 'under_offer', 'sold', 'rented', 'inactive'];
-const PROPERTY_PURPOSE = ['forSale', 'forRent'];
-const LAND_UNITS = ['sqft', 'cent', 'acre', 'ground'];
+const PROPERTY_PURPOSE = ['forSale', 'forRent', 'For Sale', 'For Rent', 'Lease'];
+const LAND_UNITS = ['sqft', 'cent', 'acre', 'ground', 'Sq.Ft', 'Cent', 'Acre', 'Ground'];
 
 const PropertySchema = new mongoose.Schema(
   {
@@ -78,6 +83,67 @@ const PropertySchema = new mongoose.Schema(
       type: String,
       trim: true,
       default: 'Tamil Nadu',
+    },
+    district: {
+      type: String,
+      trim: true,
+      default: '',
+      index: true,
+    },
+    locality: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    ownerName: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    contactPhone: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    roadWidth: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    facingDirection: {
+      type: String,
+      trim: true,
+      default: 'East',
+    },
+    approvalStatus: {
+      type: String,
+      trim: true,
+      default: 'DTCP Approved',
+    },
+    priceNegotiable: {
+      type: String,
+      trim: true,
+      default: 'Yes',
+    },
+    cornerPlot: {
+      type: Boolean,
+      default: false,
+    },
+    gatedCommunity: {
+      type: Boolean,
+      default: false,
+    },
+    waterAvailable: {
+      type: Boolean,
+      default: false,
+    },
+    electricityAvailable: {
+      type: Boolean,
+      default: false,
+    },
+    documents: {
+      type: [String],
+      default: [],
     },
     pincode: {
       type: String,

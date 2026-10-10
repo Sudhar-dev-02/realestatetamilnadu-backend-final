@@ -223,10 +223,30 @@ const getMyProperties = async (req, res, next) => {
       if (c._id) countMap[c._id.toString()] = c.count;
     });
 
-    const propertiesWithCounts = properties.map((p) => ({
-      ...p,
-      interestCount: countMap[p._id.toString()] || 0,
-    }));
+    const promoSettings = await PromotionSetting.findOne() || {};
+    const freeValidityDays = promoSettings.sellerListingSettings?.freeListingValidityDays ?? 30;
+    const expiryThreshold = new Date();
+    expiryThreshold.setDate(expiryThreshold.getDate() - freeValidityDays);
+
+    const propertiesWithCounts = properties.map((p) => {
+      const isPaid = p.listingPayment?.isPaid === true;
+      const isExpired = !isPaid && p.createdAt < expiryThreshold;
+      
+      let daysLeft = null;
+      if (!isPaid) {
+        const expiryDate = new Date(p.createdAt);
+        expiryDate.setDate(expiryDate.getDate() + freeValidityDays);
+        const diffTime = expiryDate - new Date();
+        daysLeft = Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
+      }
+
+      return {
+        ...p,
+        isExpired,
+        daysLeft,
+        interestCount: countMap[p._id.toString()] || 0,
+      };
+    });
 
     return sendPaginated(
       res,
@@ -540,12 +560,69 @@ const createProperty = async (req, res, next) => {
     }
   };
 
+  const renewProperty = async (req, res, next) => {
+    try {
+      const { paymentDetails } = req.body;
+      const property = await Property.findOne({ _id: req.params.id, seller: req.user._id });
+      if (!property) return sendError(res, 'Property not found', 404);
+
+      const promoSettings = await PromotionSetting.findOne() || {};
+      const paidListingFee = promoSettings.sellerListingSettings?.paidListingFee ?? 99;
+
+      if (!paymentDetails || (!paymentDetails.transactionId && !paymentDetails.orderId)) {
+        return sendError(res, 'Payment details are required to renew property.', 400);
+      }
+
+      let txnId = (paymentDetails.transactionId || paymentDetails.orderId || '').trim();
+      let paymentMethod = 'UPI / Manual QR';
+
+      if (paymentDetails.gateway === 'cashfree' || paymentDetails.orderId) {
+        const orderId = (paymentDetails.orderId || paymentDetails.transactionId).trim();
+        try {
+          const orderDetails = await cashfreeApiRequest(`/pg/orders/${orderId}`, 'GET');
+          if (orderDetails.order_status !== 'PAID') {
+            return sendError(res, `Payment is not completed. Status: ${orderDetails.order_status}`, 400);
+          }
+          txnId = orderId;
+          paymentMethod = 'Cashfree Online Gateway';
+        } catch (cfErr) {
+          return sendError(res, `Payment gateway verification failed: ${cfErr.message}`, 400);
+        }
+      }
+
+      property.listingPayment = {
+        isPaid: true,
+        amountPaid: paidListingFee,
+        transactionId: txnId,
+        paymentDate: new Date(),
+      };
+
+      await property.save();
+
+      await SubscriptionTransaction.create({
+        seller: req.user._id,
+        planName: `Property Renewal Fee (₹${paidListingFee})`,
+        billingCycle: 'pay_per_listing',
+        amountPaid: paidListingFee,
+        currency: 'INR',
+        paymentMethod: paymentMethod,
+        transactionId: txnId,
+        property: property._id,
+      });
+
+      return sendSuccess(res, 'Property renewed and unlocked successfully!', property);
+    } catch (error) {
+      next(error);
+    }
+  };
+
   module.exports = {
     getSellerProfile,
     updateSellerProfile,
     upgradeSellerPlan,
     getMyProperties,
     createProperty,
+    renewProperty,
     updateMyProperty,
     deleteMyProperty,
     createPromotionRequest,

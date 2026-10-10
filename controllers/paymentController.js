@@ -41,7 +41,7 @@ if (!CASHFREE_APP_ID || !CASHFREE_SECRET_KEY) {
 } else if (CONFIGURED_CASHFREE_ENV && CONFIGURED_CASHFREE_ENV !== CASHFREE_ENV) {
   console.warn(
     `[Cashfree] CASHFREE_ENV="${process.env.CASHFREE_ENV}" does not match the supplied credentials. ` +
-      `Using ${CASHFREE_ENV} (${CASHFREE_HOST}) to avoid "authentication Failed" errors.`
+    `Using ${CASHFREE_ENV} (${CASHFREE_HOST}) to avoid "authentication Failed" errors.`
   );
 }
 
@@ -80,8 +80,8 @@ const buildCashfreeError = (statusCode, parsed) => {
   if (isAuthenticationFailure) {
     return new Error(
       `Cashfree authentication failed (HTTP ${statusCode}) on the ${CASHFREE_ENV} gateway. ` +
-        `Make sure CASHFREE_APP_ID and CASHFREE_SECRET_KEY in backend/.env belong to the same Cashfree environment (${CASHFREE_HOST}) ` +
-        `and that CASHFREE_ENV=${CASHFREE_ENV}.`
+      `Make sure CASHFREE_APP_ID and CASHFREE_SECRET_KEY in backend/.env belong to the same Cashfree environment (${CASHFREE_HOST}) ` +
+      `and that CASHFREE_ENV=${CASHFREE_ENV}.`
     );
   }
 
@@ -240,6 +240,47 @@ const verifyCashfreePayment = async (req, res, next) => {
     const orderDetails = await cashfreeApiRequest(`/pg/orders/${orderId}`, 'GET');
 
     if (orderDetails.order_status !== 'PAID') {
+      const isSocialMedia =
+        promotionCategory === 'SOCIAL_MEDIA' ||
+        (orderId && orderId.toLowerCase().includes('social')) ||
+        Boolean(socialMediaPlanId || socialMediaPlanName);
+
+      const actualCategory = isSocialMedia ? 'SOCIAL_MEDIA' : 'TOP_LISTING';
+      const actualType = isSocialMedia ? 'SOCIAL_MEDIA' : 'TOP_LIST_LANDING';
+      
+      let failDurationDays = 7;
+      if (durationPlan === '1_month' || durationPlan === 'month') {
+        failDurationDays = 30;
+      }
+      
+      const existingFailed = await PromotionRequest.findOne({ transactionId: orderId });
+      if (!existingFailed) {
+        try {
+          await PromotionRequest.create({
+            mediator: req.user._id,
+            promotionCategory: actualCategory,
+            promotionType: actualType,
+            topListingScope: actualCategory === 'TOP_LISTING' ? (topListingScope === 'overall' ? 'overall' : 'district_wise') : undefined,
+            selectedDistrict: actualCategory === 'TOP_LISTING' ? (topListingScope === 'overall' ? '' : selectedDistrict) : undefined,
+            durationPlan: durationPlan === '1_month' ? '1_month' : '1_week',
+            durationDays: actualCategory === 'SOCIAL_MEDIA' ? 0 : failDurationDays,
+            socialMediaPlanId: isSocialMedia ? socialMediaPlanId : undefined,
+            socialMediaPlanName: isSocialMedia ? socialMediaPlanName : undefined,
+            socialMediaServices: isSocialMedia ? socialMediaServices : [],
+            property: propertyId || null,
+            amountPaid: Number(orderDetails.order_amount) || Number(amountPaid) || 0,
+            paymentReceipt: 'CASHFREE_ONLINE_PAYMENT_FAILED',
+            transactionId: orderId,
+            status: 'failed',
+            startDate: null,
+            endDate: null,
+            adminNotes: `Payment Unsuccessful: ${orderDetails.order_status}. Property was NOT promoted.`,
+          });
+        } catch (err) {
+          console.warn('Could not record failed promotion payment:', err.message);
+        }
+      }
+
       return sendError(res, `Payment is not completed. Status: ${orderDetails.order_status}`, 400);
     }
 
@@ -290,18 +331,26 @@ const verifyCashfreePayment = async (req, res, next) => {
       }
     }
 
+    const isSocialMedia =
+      promotionCategory === 'SOCIAL_MEDIA' ||
+      (orderId && orderId.toLowerCase().includes('social')) ||
+      Boolean(socialMediaPlanId || socialMediaPlanName);
+
+    const actualCategory = isSocialMedia ? 'SOCIAL_MEDIA' : 'TOP_LISTING';
+    const actualType = isSocialMedia ? 'SOCIAL_MEDIA' : 'TOP_LIST_LANDING';
+
     // Auto-approve and create promotion record
     const promotionRequest = new PromotionRequest({
       mediator: req.user._id,
-      promotionCategory: promotionCategory === 'SOCIAL_MEDIA' ? 'SOCIAL_MEDIA' : 'TOP_LISTING',
-      promotionType: 'TOP_LIST_LANDING',
-      topListingScope: topListingScope === 'overall' ? 'overall' : 'district_wise',
-      selectedDistrict: topListingScope === 'overall' ? '' : (selectedDistrict || (targetProperty ? targetProperty.city : '') || ''),
+      promotionCategory: actualCategory,
+      promotionType: actualType,
+      topListingScope: actualCategory === 'TOP_LISTING' ? (topListingScope === 'overall' ? 'overall' : 'district_wise') : undefined,
+      selectedDistrict: actualCategory === 'TOP_LISTING' ? (topListingScope === 'overall' ? '' : (selectedDistrict || (targetProperty ? targetProperty.city : '') || '')) : undefined,
       durationPlan: durationPlan === '1_month' ? '1_month' : '1_week',
       durationDays,
-      socialMediaPlanId,
-      socialMediaPlanName,
-      socialMediaServices,
+      socialMediaPlanId: isSocialMedia ? socialMediaPlanId : undefined,
+      socialMediaPlanName: isSocialMedia ? socialMediaPlanName : undefined,
+      socialMediaServices: isSocialMedia ? socialMediaServices : [],
       property: propertyId || null,
       amountPaid: Number(orderDetails.order_amount) || Number(amountPaid) || 299,
       paymentReceipt: 'CASHFREE_ONLINE_PAYMENT',
@@ -309,13 +358,13 @@ const verifyCashfreePayment = async (req, res, next) => {
       status: 'approved', // AUTO APPROVED ON ONLINE PAYMENT SUCCESS
       startDate,
       endDate,
-      adminNotes: `Auto-approved via Cashfree Online Gateway on ${startDate.toLocaleString('en-IN')}`,
+      adminNotes: `Auto-approved via Cashfree Online Gateway (${actualCategory}) on ${startDate.toLocaleString('en-IN')}`,
     });
 
     await promotionRequest.save();
 
     // If Top Listing, immediately activate top listing on Property
-    if (promotionCategory !== 'SOCIAL_MEDIA' && targetProperty) {
+    if (actualCategory === 'TOP_LISTING' && targetProperty) {
       targetProperty.featured = true;
       targetProperty.topListing = {
         isActive: true,
@@ -331,7 +380,11 @@ const verifyCashfreePayment = async (req, res, next) => {
       .populate('mediator', 'name email phone role')
       .populate('property');
 
-    return sendSuccess(res, 'Online payment verified successfully! Promotion is now ACTIVE.', populatedRequest, 201);
+    const successMessage = isSocialMedia
+      ? 'Online payment verified successfully! Social Media Campaign application submitted & active.'
+      : 'Online payment verified successfully! Property is now TOP LISTED.';
+
+    return sendSuccess(res, successMessage, populatedRequest, 201);
   } catch (error) {
     console.error('Error verifying Cashfree payment:', error.message);
     return sendError(res, error.message || 'Failed to verify payment', error.statusCode || 500);
@@ -358,7 +411,14 @@ const createSubscriptionOrder = async (req, res, next) => {
     }
 
     let clientUrl = process.env.CLIENT_URL || 'https://realestatetamilnadu.com';
-    let returnUrl = req.body.returnUrl || `${clientUrl}/seller/dashboard?order_id={order_id}`;
+    let returnUrl = req.body.returnUrl;
+    if (!returnUrl) {
+      if (user.role === 'MEDIATOR') {
+        returnUrl = `${clientUrl}/mediator/subscription-plans?order_id={order_id}`;
+      } else {
+        returnUrl = `${clientUrl}/seller/dashboard?order_id={order_id}`;
+      }
+    }
     if (!returnUrl.includes('{order_id}')) {
       returnUrl += (returnUrl.includes('?') ? '&' : '?') + 'order_id={order_id}';
     }
@@ -423,7 +483,50 @@ const verifySubscriptionPayment = async (req, res, next) => {
     const orderDetails = await cashfreeApiRequest(`/pg/orders/${orderId}`, 'GET');
 
     if (orderDetails.order_status !== 'PAID') {
-      return sendError(res, `Payment is not completed. Status: ${orderDetails.order_status}`, 400);
+      const SubscriptionTransaction = require('../models/SubscriptionTransaction');
+      const isAnnual = billingCycle === 'annual' || billingCycle === 'yearly' || Number(durationMonths) === 12;
+      let finalPlanName = planName;
+      if (!finalPlanName) {
+        if (planId === 'enterprise_partner') {
+          finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
+        } else if (planId === 'pro_mediator') {
+          finalPlanName = isAnnual ? 'Pro Mediator Plan (1 Year)' : 'Pro Mediator Plan';
+        } else if (planId === 'basic_mediator') {
+          finalPlanName = isAnnual ? 'Basic Mediator Plan (1 Year)' : 'Basic Mediator Plan';
+        } else if (user.role === 'SELLER') {
+          finalPlanName = isAnnual ? 'Seller Direct Lead Pass (1 Year)' : 'Seller Direct Lead Pass (1 Month)';
+        } else {
+          finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
+        }
+      }
+
+      const existingTxn = await SubscriptionTransaction.findOne({ transactionId: orderId });
+      if (!existingTxn) {
+        try {
+          await SubscriptionTransaction.create({
+            user: user._id,
+            userName: user.name || 'Member',
+            userRole: user.role || 'USER',
+            userEmail: user.email || '',
+            planName: finalPlanName,
+            billingCycle: billingCycle || 'monthly',
+            amountPaid: Number(orderDetails.order_amount) || Number(amountPaid) || 0,
+            currency: 'INR',
+            transactionStatus: 'failed',
+            paymentMethod: 'Cashfree Online Gateway',
+            transactionId: orderId,
+            purchaseDate: new Date(),
+            notes: `Payment Failed/Cancelled: ${orderDetails.order_status}`,
+          });
+        } catch (err) {
+          console.warn('Non-critical failed subscription log error:', err.message);
+        }
+      }
+
+      const statusNote = orderDetails.order_status === 'ACTIVE'
+        ? 'Payment was cancelled or pending'
+        : `Payment status: ${orderDetails.order_status}`;
+      return sendError(res, `Payment could not be completed (${statusNote}). Please try again.`, 400);
     }
 
     const isAnnual = billingCycle === 'annual' || billingCycle === 'yearly' || Number(durationMonths) === 12;
@@ -444,14 +547,20 @@ const verifySubscriptionPayment = async (req, res, next) => {
 
     let finalPlanName = planName;
     if (!finalPlanName) {
-      if (user.role === 'SELLER') {
+      if (planId === 'enterprise_partner') {
+        finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
+      } else if (planId === 'pro_mediator') {
+        finalPlanName = isAnnual ? 'Pro Mediator Plan (1 Year)' : 'Pro Mediator Plan';
+      } else if (planId === 'basic_mediator') {
+        finalPlanName = isAnnual ? 'Basic Mediator Plan (1 Year)' : 'Basic Mediator Plan';
+      } else if (user.role === 'SELLER') {
         finalPlanName = isAnnual ? 'Seller Direct Lead Pass (1 Year)' : 'Seller Direct Lead Pass (1 Month)';
       } else {
-        finalPlanName = isAnnual ? 'Pro Mediator Plan (1 Year)' : 'Pro Mediator Plan (1 Month)';
+        finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
       }
     }
 
-    const finalAmount = Number(orderDetails.order_amount) || Number(amountPaid) || (isAnnual ? 24990 : 2499);
+    const finalAmount = Number(orderDetails.order_amount) || Number(amountPaid) || (isAnnual ? 49990 : 4999);
     const now = new Date();
     const isCurrentActive =
       user.subscription?.status === 'active' &&
@@ -463,42 +572,31 @@ const verifySubscriptionPayment = async (req, res, next) => {
     if (isCurrentActive) {
       const currentEndDate = new Date(user.subscription.endDate);
       const isSamePlan = user.subscription?.planId === planId;
+      const newEndDate = new Date(currentEndDate.getTime() + durationDays * 24 * 60 * 60 * 1000);
 
-      if (isSamePlan) {
-        // Same plan renewal: extend duration directly
-        const newEndDate = new Date(currentEndDate.getTime() + durationDays * 24 * 60 * 60 * 1000);
-        user.subscription.endDate = newEndDate;
-        user.subscription.amountPaid = (user.subscription.amountPaid || 0) + finalAmount;
-        user.subscription.transactionId = txnId;
-        user.subscription.notes = `Renewed & Extended seamlessly via Cashfree on ${now.toLocaleString('en-IN')}`;
+      user.subscription = {
+        planId: planId || user.subscription?.planId || 'enterprise_partner',
+        planName: finalPlanName,
+        billingCycle: isAnnual ? 'annual' : 'monthly',
+        status: 'active',
+        startDate: user.subscription.startDate || now,
+        endDate: newEndDate,
+        amountPaid: (user.subscription.amountPaid || 0) + finalAmount,
+        transactionId: txnId,
+        paymentReceipt: 'CASHFREE_ONLINE_PAYMENT',
+        submittedAt: now,
+        notes: `${isSamePlan ? 'Renewed' : 'Upgraded to ' + finalPlanName} & Extended seamlessly via Cashfree on ${now.toLocaleString('en-IN')}`,
+      };
+      user.queuedSubscription = undefined;
 
-        successMessage = `🎉 Subscription renewed successfully! Your ${finalPlanName} has been extended until ${newEndDate.toLocaleDateString('en-IN')}.`;
-      } else {
-        // Different plan: queue it to auto-activate when the current active plan finishes
-        const queuedStartDate = currentEndDate;
-        const queuedEndDate = new Date(queuedStartDate.getTime() + durationDays * 24 * 60 * 60 * 1000);
-
-        user.queuedSubscription = {
-          planId: planId || 'pro_mediator',
-          planName: finalPlanName,
-          billingCycle: isAnnual ? 'annual' : 'monthly',
-          status: 'queued',
-          startDate: queuedStartDate,
-          endDate: queuedEndDate,
-          amountPaid: finalAmount,
-          transactionId: txnId,
-          notes: `Queued to auto-activate on ${queuedStartDate.toLocaleDateString('en-IN')} after current plan ends.`,
-        };
-
-        successMessage = `🎉 Payment verified! Your new ${finalPlanName} is queued and will automatically activate on ${queuedStartDate.toLocaleDateString('en-IN')} when your current plan finishes.`;
-      }
+      successMessage = `🎉 Subscription ${isSamePlan ? 'extended' : 'upgraded to ' + finalPlanName} successfully! Your plan is active until ${newEndDate.toLocaleDateString('en-IN')}.`;
     } else {
       // Immediate activation
       const startDate = now;
       const endDate = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
 
       user.subscription = {
-        planId: planId || (user.role === 'SELLER' ? (isAnnual ? 'seller_premium_annual' : 'seller_premium_monthly') : 'pro_mediator'),
+        planId: planId || (user.role === 'SELLER' ? (isAnnual ? 'seller_premium_annual' : 'seller_premium_monthly') : 'enterprise_partner'),
         planName: finalPlanName,
         billingCycle: isAnnual ? 'annual' : 'monthly',
         status: 'active',
@@ -681,4 +779,5 @@ module.exports = {
   recordFailedPayment,
   cashfreeWebhook,
   cashfreeApiRequest,
+  CASHFREE_ENV,
 };

@@ -1211,6 +1211,7 @@ const updatePromotionSettings = async (req, res, next) => {
     if (sellerListingSettings !== undefined) {
       settings.sellerListingSettings = {
         freeListingLimit: Math.max(0, parseInt(sellerListingSettings.freeListingLimit, 10) || 0),
+        freeListingValidityDays: Math.max(1, parseInt(sellerListingSettings.freeListingValidityDays, 10) || 30),
         paidListingFee: Math.max(0, parseInt(sellerListingSettings.paidListingFee, 10) || 0),
       };
     }
