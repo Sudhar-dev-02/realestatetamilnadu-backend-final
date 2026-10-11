@@ -50,10 +50,14 @@ const handlePropertyShare = async (req, res) => {
     const forwardedProto = req.get('x-forwarded-proto');
     const isHttps = req.secure || forwardedProto === 'https' || process.env.NODE_ENV === 'production';
     const protocol = isHttps ? 'https' : req.protocol;
-    const baseUrl = process.env.PUBLIC_URL || `${protocol}://${host}`;
+    
+    // If request comes from Netlify proxy or custom domain, prefer that as canonical
+    const forwardedHost = req.get('x-forwarded-host');
+    const effectiveHost = forwardedHost || host;
+    const baseUrl = process.env.PUBLIC_URL || `${protocol}://${effectiveHost}`;
 
     // Target frontend base URL for redirection
-    const clientBaseUrl = (process.env.CLIENT_URL || baseUrl).replace(/\/+$/, '');
+    const clientBaseUrl = (process.env.CLIENT_URL || (forwardedHost ? `${protocol}://${forwardedHost}` : 'https://realestatetamilnadu.netlify.app')).replace(/\/+$/, '');
 
     if (!property) {
       res.status(404).set('Content-Type', 'text/html; charset=utf-8');
