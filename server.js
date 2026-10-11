@@ -30,6 +30,7 @@ const sellerRoutes = require('./routes/sellerRoutes');
 const propertyRoutes = require('./routes/propertyRoutes');
 const publicSettingsRoutes = require('./routes/publicSettingsRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
+const shareRoutes = require('./routes/shareRoutes');
 
 // Middleware Handlers
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
@@ -124,6 +125,9 @@ app.use('/api/mediator', mediatorRoutes);
 app.use('/api/seller', sellerRoutes);
 app.use('/api/properties', propertyRoutes);
 app.use('/api/payment', paymentRoutes);
+
+// Dynamic Social OG Metadata Sharing Routes (/property/:id, /p/:id)
+app.use(shareRoutes);
 
 // Centralized Error Handling
 app.use(notFound);

@@ -486,17 +486,24 @@ const verifySubscriptionPayment = async (req, res, next) => {
       const SubscriptionTransaction = require('../models/SubscriptionTransaction');
       const isAnnual = billingCycle === 'annual' || billingCycle === 'yearly' || Number(durationMonths) === 12;
       let finalPlanName = planName;
+      if (!finalPlanName && planId) {
+        try {
+          const SubscriptionPlan = require('../models/SubscriptionPlan');
+          const dbPlan = await SubscriptionPlan.findById(planId);
+          if (dbPlan) finalPlanName = isAnnual ? `${dbPlan.name} (1 Year)` : dbPlan.name;
+        } catch (e) {}
+      }
       if (!finalPlanName) {
-        if (planId === 'enterprise_partner') {
-          finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
-        } else if (planId === 'pro_mediator') {
-          finalPlanName = isAnnual ? 'Pro Mediator Plan (1 Year)' : 'Pro Mediator Plan';
-        } else if (planId === 'basic_mediator') {
-          finalPlanName = isAnnual ? 'Basic Mediator Plan (1 Year)' : 'Basic Mediator Plan';
+        if (planId === 'starter' || (typeof planId === 'string' && planId.toLowerCase().includes('starter'))) {
+          finalPlanName = isAnnual ? 'Starter Plan (1 Year)' : 'Starter Plan';
+        } else if (planId === 'growth' || (typeof planId === 'string' && planId.toLowerCase().includes('growth'))) {
+          finalPlanName = isAnnual ? 'Growth Plan (1 Year)' : 'Growth Plan';
+        } else if (planId === 'pro' || (typeof planId === 'string' && planId.toLowerCase().includes('pro'))) {
+          finalPlanName = isAnnual ? 'Pro Plan (1 Year)' : 'Pro Plan';
         } else if (user.role === 'SELLER') {
           finalPlanName = isAnnual ? 'Seller Direct Lead Pass (1 Year)' : 'Seller Direct Lead Pass (1 Month)';
         } else {
-          finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
+          finalPlanName = isAnnual ? 'Growth Plan (1 Year)' : 'Growth Plan';
         }
       }
 
@@ -546,17 +553,24 @@ const verifySubscriptionPayment = async (req, res, next) => {
     }
 
     let finalPlanName = planName;
+    if (!finalPlanName && planId) {
+      try {
+        const SubscriptionPlan = require('../models/SubscriptionPlan');
+        const dbPlan = await SubscriptionPlan.findById(planId);
+        if (dbPlan) finalPlanName = isAnnual ? `${dbPlan.name} (1 Year)` : dbPlan.name;
+      } catch (e) {}
+    }
     if (!finalPlanName) {
-      if (planId === 'enterprise_partner') {
-        finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
-      } else if (planId === 'pro_mediator') {
-        finalPlanName = isAnnual ? 'Pro Mediator Plan (1 Year)' : 'Pro Mediator Plan';
-      } else if (planId === 'basic_mediator') {
-        finalPlanName = isAnnual ? 'Basic Mediator Plan (1 Year)' : 'Basic Mediator Plan';
+      if (planId === 'starter' || (typeof planId === 'string' && planId.toLowerCase().includes('starter'))) {
+        finalPlanName = isAnnual ? 'Starter Plan (1 Year)' : 'Starter Plan';
+      } else if (planId === 'growth' || (typeof planId === 'string' && planId.toLowerCase().includes('growth'))) {
+        finalPlanName = isAnnual ? 'Growth Plan (1 Year)' : 'Growth Plan';
+      } else if (planId === 'pro' || (typeof planId === 'string' && planId.toLowerCase().includes('pro'))) {
+        finalPlanName = isAnnual ? 'Pro Plan (1 Year)' : 'Pro Plan';
       } else if (user.role === 'SELLER') {
         finalPlanName = isAnnual ? 'Seller Direct Lead Pass (1 Year)' : 'Seller Direct Lead Pass (1 Month)';
       } else {
-        finalPlanName = isAnnual ? 'Enterprise Partner Plan (1 Year)' : 'Enterprise Partner Plan';
+        finalPlanName = isAnnual ? 'Growth Plan (1 Year)' : 'Growth Plan';
       }
     }
 

@@ -8,6 +8,7 @@ const {
   submitPropertyEnquiry,
   submitPublicProperty,
   getSellerListingQuota,
+  getPublicMediators,
   getPublicMediatorProfile,
   getPublicSellerProfile,
 } = require('../controllers/propertyController');
@@ -33,6 +34,7 @@ router.post('/upload-images', (req, res, next) => {
 
 // Public property routes
 router.get('/', getPublicProperties);
+router.get('/mediators-public', getPublicMediators);
 router.get('/seller-listing-quota', getSellerListingQuota);
 router.post('/submit-public', submitPublicProperty);
 router.get('/mediator-public/:id', getPublicMediatorProfile);

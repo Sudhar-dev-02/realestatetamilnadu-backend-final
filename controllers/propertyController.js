@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const { Property } = require('../models/Property');
 const PropertyEnquiry = require('../models/PropertyEnquiry');
@@ -182,7 +183,13 @@ const getPublicProperties = async (req, res, next) => {
  */
 const getPublicPropertyById = async (req, res, next) => {
   try {
-    const property = await Property.findById(req.params.id)
+    const rawId = (req.params.id || '').trim();
+    const queryConditions = [{ propertyId: rawId }];
+    if (mongoose.Types.ObjectId.isValid(rawId)) {
+      queryConditions.push({ _id: rawId });
+    }
+
+    const property = await Property.findOne({ $or: queryConditions })
       .populate({
         path: 'seller',
         select: 'name email phone role isVerified referredBy profile sellerPlan subscription',
@@ -943,6 +950,105 @@ const getSellerListingQuota = async (req, res, next) => {
 };
 
 /**
+ * @desc    Get Public Verified Mediators List (with search, district & taluk filter, pagination)
+ * @route   GET /api/properties/mediators-public
+ * @access  Public
+ */
+const getPublicMediators = async (req, res, next) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 12;
+    const skip = (page - 1) * limit;
+
+    const query = {
+      role: 'MEDIATOR',
+      isActive: true,
+    };
+
+    // Keyword search: mediator name, agencyName, referralCode/ID
+    if (req.query.search && String(req.query.search).trim()) {
+      const kw = escapeRegex(String(req.query.search).trim());
+      const regex = new RegExp(kw, 'i');
+      query.$or = [
+        { name: regex },
+        { 'profile.agencyName': regex },
+        { referralCode: regex },
+      ];
+    }
+
+    // District filter
+    if (req.query.district && req.query.district !== 'all' && String(req.query.district).trim()) {
+      const distRegex = new RegExp(escapeRegex(String(req.query.district).trim()), 'i');
+      query.$and = query.$and || [];
+      query.$and.push({
+        $or: [
+          { 'profile.primaryDistrict': distRegex },
+          { 'profile.city': distRegex },
+          { 'profile.address': distRegex },
+        ],
+      });
+    }
+
+    // Taluk filter
+    if (req.query.taluk && req.query.taluk !== 'all' && String(req.query.taluk).trim()) {
+      const talukRegex = new RegExp(`^${escapeRegex(String(req.query.taluk).trim())}$`, 'i');
+      query['profile.serviceTaluks'] = { $in: [talukRegex] };
+    }
+
+    const sortOption = {};
+    if (req.query.sortBy === 'oldest') {
+      sortOption.createdAt = 1;
+    } else if (req.query.sortBy === 'name') {
+      sortOption.name = 1;
+    } else {
+      sortOption.createdAt = -1; // Default: Newest First
+    }
+
+    const total = await User.countDocuments(query);
+    const mediators = await User.find(query)
+      .select('_id name email phone profile referralCode isVerified createdAt')
+      .sort(sortOption)
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    // Accurate district counts for the sidebar filter
+    const allActiveMediators = await User.find({ role: 'MEDIATOR', isActive: true })
+      .select('profile.primaryDistrict profile.city')
+      .lean();
+
+    const districtCountMap = {};
+    allActiveMediators.forEach((m) => {
+      const pDist = m.profile?.primaryDistrict && String(m.profile.primaryDistrict).trim();
+      const pCity = m.profile?.city && String(m.profile.city).trim();
+      const dist = pDist || pCity || 'Others';
+      districtCountMap[dist] = (districtCountMap[dist] || 0) + 1;
+    });
+
+    const districtStats = Object.keys(districtCountMap).map((k) => ({
+      _id: k,
+      count: districtCountMap[k],
+    }));
+
+    return res.status(200).json({
+      success: true,
+      message: 'Public mediators retrieved successfully',
+      data: mediators,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        totalPages: Math.ceil(total / limit) || 1,
+      },
+      totalAllMediators: allActiveMediators.length,
+      districtStats,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
  * @desc    Get Public Mediator Profile & Listings by Mediator ID
  * @route   GET /api/properties/mediator-public/:id
  * @access  Public
@@ -958,22 +1064,25 @@ const getPublicMediatorProfile = async (req, res, next) => {
       return sendError(res, 'Mediator profile not found', 404);
     }
 
-    if (mediator.isVerified === false) {
-      return sendError(res, 'This mediator is currently pending verification and their profile is not public.', 403);
-    }
+    const sellers = await User.find({
+      role: 'SELLER',
+      referredBy: mediatorId,
+    }).select('_id');
+    const referredSellerIds = sellers.map((s) => s._id);
 
     const properties = await Property.find({
-      mediator: mediatorId,
-      status: 'available',
+      $or: [
+        { mediator: mediatorId },
+        { seller: mediatorId },
+        ...(referredSellerIds.length > 0 ? [{ seller: { $in: referredSellerIds } }] : []),
+      ],
+      status: { $ne: 'inactive' },
     })
       .populate('seller', 'name email phone')
       .sort({ createdAt: -1 })
       .limit(30);
 
-    const sellersCount = await User.countDocuments({
-      role: 'SELLER',
-      referredBy: mediatorId,
-    });
+    const sellersCount = sellers.length;
 
     const enquiriesCount = await PropertyEnquiry.countDocuments({
       mediator: mediatorId,
@@ -1078,6 +1187,7 @@ module.exports = {
   submitPropertyEnquiry,
   submitPublicProperty,
   getSellerListingQuota,
+  getPublicMediators,
   getPublicMediatorProfile,
   getPublicSellerProfile,
 };
